@@ -43,7 +43,7 @@ const PROXY_SIGNATURE: [u8; 12] = [
 const PROXY_PROTOCOL_VERSION: u8 = 2;
 
 #[repr(u8)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 /// A PROXYv2 Command
 pub enum Command {
     Local,
@@ -61,7 +61,7 @@ impl Command {
 }
 
 #[repr(u8)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 /// A PROXYv2 family
 pub enum Family {
     Unspecified,
@@ -92,7 +92,7 @@ impl Family {
 }
 
 #[repr(u8)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 /// A PROXYv2 protocol
 pub enum Protocol {
     Unspecified,
@@ -111,6 +111,7 @@ impl Protocol {
     }
 }
 
+#[derive(PartialEq, Debug)]
 struct ProxyInfo {
     command: Command,
     family: Family,
@@ -119,6 +120,7 @@ struct ProxyInfo {
     discovered_src: Option<SocketAddr>,
 }
 
+#[derive(PartialEq, Debug)]
 enum ProxyResult {
     Proxy(ProxyInfo),
     SignatureBytes([u8; PROXY_SIGNATURE.len()]),
@@ -140,10 +142,7 @@ pub struct WrappedStream {
 impl tonic::transport::server::Connected for WrappedStream {
     type ConnectInfo = Option<SocketAddr>;
     fn connect_info(&self) -> Self::ConnectInfo {
-        Some(
-            self.discovered_src
-                .unwrap_or_else(|| self.inner.remote_addr()),
-        )
+        Some(self.source())
     }
 }
 
@@ -212,7 +211,7 @@ async fn read_proxy<R: AsyncRead + Unpin>(mut read: R) -> io::Result<(ProxyResul
         }
     };
 
-    let len = u16::from_be_bytes([header[3], header[4]]);
+    let len = u16::from_be_bytes([header[2], header[3]]) as usize;
     let target_len = if matches!(command, Command::Local) {
         None
     } else {
@@ -220,7 +219,7 @@ async fn read_proxy<R: AsyncRead + Unpin>(mut read: R) -> io::Result<(ProxyResul
     };
 
     if let Some(target_len) = target_len {
-        if len as usize != target_len {
+        if len < target_len {
             debug!("invalid proxy address length: {}", target_len);
             return Err(io::Error::new(
                 ErrorKind::InvalidData,
@@ -231,8 +230,8 @@ async fn read_proxy<R: AsyncRead + Unpin>(mut read: R) -> io::Result<(ProxyResul
 
     let mut raw =
         unsafe { MaybeUninit::<[u8; PROXY_PACKET_MAX_PROXY_ADDR_SIZE]>::uninit().assume_init() };
-    read.read_exact(&mut raw[..len as usize]).await?;
-    let raw = &raw[..len as usize];
+    read.read_exact(&mut raw[..len]).await?;
+    let raw = &raw[..len];
 
     let mut discovered_src = None;
     let mut discovered_dest = None;
@@ -411,5 +410,25 @@ impl AsyncWrite for WrappedStream {
 impl Drop for WrappedStream {
     fn drop(&mut self) {
         self.conn_count.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_parse() {
+        let raw = hex::decode("0d0a0d0a000d0a515549540a21110054ffffffffac1f1cd1898801bb030004508978bb04003e0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000").unwrap();
+        assert_eq!(
+            read_proxy(&raw[..]).await.unwrap().0,
+            ProxyResult::Proxy(ProxyInfo {
+                command: Command::Proxy,
+                family: Family::Ipv4,
+                protocol: Protocol::Stream,
+                discovered_dest: Some("172.31.28.209:443".parse().unwrap()),
+                discovered_src: Some("255.255.255.255:35208".parse().unwrap()),
+            })
+        );
     }
 }
