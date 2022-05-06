@@ -132,7 +132,7 @@ pub struct WrappedStream {
     #[cfg(feature = "track_conn_count")]
     conn_count: Arc<AtomicU64>,
     pending_read_proxy:
-        Option<Pin<Box<dyn Future<Output = io::Result<(ProxyResult, Pin<Box<AddrStream>>)>>>>>,
+        Option<Pin<Box<dyn Future<Output = io::Result<(ProxyResult, Pin<Box<AddrStream>>)>> + Send + Sync + 'static>>>,
     info: Option<ProxyInfo>,
     fused_error: bool,
     proxy_mode: ProxyMode,
