@@ -333,10 +333,6 @@ impl AsyncRead for WrappedStream {
             Poll::Ready(Err(e)) => {
                 self.fused_error = true;
                 self.pending_read_proxy = None;
-                #[cfg(feature = "tonic")]
-                {
-                    *self.connect_info.write().unwrap() = Some(self.source());
-                }
                 Poll::Ready(Err(e))
             }
             Poll::Ready(Ok((ProxyResult::SignatureBytes(bytes), stream))) => {
