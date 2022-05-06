@@ -142,31 +142,32 @@ pub struct WrappedStream {
         >,
     >,
     info: Option<ProxyInfo>,
+    #[cfg(feature = "tonic")]
+    connect_info: std::sync::Arc<std::sync::RwLock<Option<SocketAddr>>>,
     fused_error: bool,
     proxy_mode: ProxyMode,
 }
 
 #[cfg(feature = "tonic")]
+#[derive(Clone)]
 pub struct TcpConnectInfo {
-    #[allow(dead_code)]
-    remote_addr: Option<SocketAddr>,
+    inner: std::sync::Arc<std::sync::RwLock<Option<SocketAddr>>>,
 }
 
 #[cfg(feature = "tonic")]
-impl Into<tonic::transport::server::TcpConnectInfo> for TcpConnectInfo {
-    fn into(self) -> tonic::transport::server::TcpConnectInfo {
-        unsafe { std::mem::transmute(self) }
+impl TcpConnectInfo {
+    pub fn remote_addr(&self) -> Option<SocketAddr> {
+        *self.inner.read().unwrap()
     }
 }
 
 #[cfg(feature = "tonic")]
 impl tonic::transport::server::Connected for WrappedStream {
-    type ConnectInfo = tonic::transport::server::TcpConnectInfo;
+    type ConnectInfo = TcpConnectInfo;
     fn connect_info(&self) -> Self::ConnectInfo {
         TcpConnectInfo {
-            remote_addr: Some(self.source()),
+            inner: self.connect_info.clone(),
         }
-        .into()
     }
 }
 
@@ -343,6 +344,10 @@ impl AsyncRead for WrappedStream {
                 self.info = Some(info);
                 self.pending_read_proxy = None;
                 self.inner = Some(stream);
+                #[cfg(feature = "tonic")]
+                {
+                    *self.connect_info.write().unwrap() = Some(self.source());
+                }
                 self.inner.as_mut().unwrap().as_mut().poll_read(cx, buf)
             }
             Poll::Pending => Poll::Pending,

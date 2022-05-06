@@ -56,6 +56,8 @@ impl Stream for WrappedIncoming {
                     inner: Some(Box::pin(stream)),
                     #[cfg(feature = "track_conn_count")]
                     conn_count: self.conn_count.clone(),
+                    #[cfg(feature = "tonic")]
+                    connect_info: Default::default(),
                     pending_read_proxy: None,
                     fused_error: false,
                     info: None,
