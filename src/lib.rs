@@ -131,18 +131,42 @@ pub struct WrappedStream {
     inner: Option<Pin<Box<AddrStream>>>,
     #[cfg(feature = "track_conn_count")]
     conn_count: Arc<AtomicU64>,
-    pending_read_proxy:
-        Option<Pin<Box<dyn Future<Output = io::Result<(ProxyResult, Pin<Box<AddrStream>>)>> + Send + Sync + 'static>>>,
+    pending_read_proxy: Option<
+        Pin<
+            Box<
+                dyn Future<Output = io::Result<(ProxyResult, Pin<Box<AddrStream>>)>>
+                    + Send
+                    + Sync
+                    + 'static,
+            >,
+        >,
+    >,
     info: Option<ProxyInfo>,
     fused_error: bool,
     proxy_mode: ProxyMode,
 }
 
 #[cfg(feature = "tonic")]
+pub struct TcpConnectInfo {
+    #[allow(dead_code)]
+    remote_addr: Option<SocketAddr>,
+}
+
+#[cfg(feature = "tonic")]
+impl Into<tonic::transport::server::TcpConnectInfo> for TcpConnectInfo {
+    fn into(self) -> tonic::transport::server::TcpConnectInfo {
+        unsafe { std::mem::transmute(self) }
+    }
+}
+
+#[cfg(feature = "tonic")]
 impl tonic::transport::server::Connected for WrappedStream {
-    type ConnectInfo = Option<SocketAddr>;
+    type ConnectInfo = tonic::transport::server::TcpConnectInfo;
     fn connect_info(&self) -> Self::ConnectInfo {
-        Some(self.source())
+        TcpConnectInfo {
+            remote_addr: Some(self.source()),
+        }
+        .into()
     }
 }
 
