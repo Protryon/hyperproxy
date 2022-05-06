@@ -280,7 +280,7 @@ impl AsyncRead for WrappedStream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        assert!(buf.capacity() >= PROXY_SIGNATURE.len());
+        assert!(buf.remaining() >= PROXY_SIGNATURE.len());
         if self.fused_error {
             return Poll::Ready(Err(io::Error::new(
                 ErrorKind::Unsupported,
@@ -312,14 +312,14 @@ impl AsyncRead for WrappedStream {
                 buf.put_slice(&bytes[..]);
                 self.pending_read_proxy = None;
                 self.inner = Some(stream);
-                Poll::Ready(Ok(()))
+                self.inner.as_mut().unwrap().as_mut().poll_read(cx, buf)
             }
             Poll::Ready(Ok((ProxyResult::Proxy(info), stream))) => {
                 self.proxy_mode = ProxyMode::None;
                 self.info = Some(info);
                 self.pending_read_proxy = None;
                 self.inner = Some(stream);
-                Poll::Ready(Ok(()))
+                self.inner.as_mut().unwrap().as_mut().poll_read(cx, buf)
             }
             Poll::Pending => Poll::Pending,
         }
