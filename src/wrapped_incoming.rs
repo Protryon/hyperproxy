@@ -11,10 +11,7 @@ use futures::Stream;
 use hyper::server::accept::Accept;
 use hyper::server::conn::AddrIncoming;
 
-use crate::{
-    Family, Protocol, ProxyMode, WrappedStream, PROXY_PACKET_HEADER_LEN,
-    PROXY_PACKET_MAX_PROXY_ADDR_SIZE,
-};
+use crate::{ProxyMode, WrappedStream};
 
 pub struct WrappedIncoming {
     inner: AddrIncoming,
@@ -56,22 +53,12 @@ impl Stream for WrappedIncoming {
                 #[cfg(feature = "track_conn_count")]
                 self.conn_count.fetch_add(1, Ordering::SeqCst);
                 Poll::Ready(Some(Ok(WrappedStream {
-                    inner: Box::pin(stream),
+                    inner: Some(Box::pin(stream)),
                     #[cfg(feature = "track_conn_count")]
                     conn_count: self.conn_count.clone(),
-                    proxy_header: [0u8; PROXY_PACKET_HEADER_LEN + PROXY_PACKET_MAX_PROXY_ADDR_SIZE], // maybe uninit?
-                    proxy_header_index: 0,
-                    proxy_header_rewrite_index: 0,
-                    proxy_header_target: if matches!(self.proxy_mode, ProxyMode::None) {
-                        0
-                    } else {
-                        PROXY_PACKET_HEADER_LEN + PROXY_PACKET_MAX_PROXY_ADDR_SIZE
-                    },
-                    discovered_dest: None,
-                    discovered_src: None,
-                    family: Family::Unspecified,
-                    protocol: Protocol::Unspecified,
-                    command: None,
+                    pending_read_proxy: None,
+                    fused_error: false,
+                    info: None,
                     proxy_mode: self.proxy_mode,
                 })))
             }

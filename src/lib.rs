@@ -17,8 +17,9 @@ use std::{
     task::{Context, Poll},
 };
 
+use futures::Future;
 use hyper::server::conn::AddrStream;
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 
 mod wrapped_incoming;
 pub use wrapped_incoming::WrappedIncoming;
@@ -110,20 +111,28 @@ impl Protocol {
     }
 }
 
-/// A wrapper over [`hyper::server::conn::AddrStream`] that grabs PROXYv2 information
-pub struct WrappedStream {
-    inner: Pin<Box<AddrStream>>,
-    #[cfg(feature = "track_conn_count")]
-    conn_count: Arc<AtomicU64>,
-    proxy_header: [u8; PROXY_PACKET_HEADER_LEN + PROXY_PACKET_MAX_PROXY_ADDR_SIZE],
-    proxy_header_index: usize,
-    proxy_header_rewrite_index: usize,
-    proxy_header_target: usize,
-    discovered_dest: Option<SocketAddr>,
-    discovered_src: Option<SocketAddr>,
-    command: Option<Command>,
+struct ProxyInfo {
+    command: Command,
     family: Family,
     protocol: Protocol,
+    discovered_dest: Option<SocketAddr>,
+    discovered_src: Option<SocketAddr>,
+}
+
+enum ProxyResult {
+    Proxy(ProxyInfo),
+    SignatureBytes([u8; PROXY_SIGNATURE.len()]),
+}
+
+/// A wrapper over [`hyper::server::conn::AddrStream`] that grabs PROXYv2 information
+pub struct WrappedStream {
+    inner: Option<Pin<Box<AddrStream>>>,
+    #[cfg(feature = "track_conn_count")]
+    conn_count: Arc<AtomicU64>,
+    pending_read_proxy:
+        Option<Pin<Box<dyn Future<Output = io::Result<(ProxyResult, Pin<Box<AddrStream>>)>>>>>,
+    info: Option<ProxyInfo>,
+    fused_error: bool,
     proxy_mode: ProxyMode,
 }
 
@@ -142,6 +151,129 @@ fn to_array<const SIZE: usize>(from: &[u8]) -> [u8; SIZE] {
     from.try_into().unwrap()
 }
 
+async fn read_proxy<R: AsyncRead + Unpin>(mut read: R) -> io::Result<(ProxyResult, R)> {
+    let mut signature = [0u8; PROXY_SIGNATURE.len()];
+    read.read_exact(&mut signature[..]).await?;
+    if signature != PROXY_SIGNATURE {
+        return Ok((ProxyResult::SignatureBytes(signature), read));
+    }
+
+    // 4 bytes
+    let mut header = [0u8; PROXY_PACKET_HEADER_LEN - PROXY_SIGNATURE.len()];
+    read.read_exact(&mut header[..]).await?;
+
+    let version = (header[0] & 0xf0) >> 4;
+    if version != PROXY_PROTOCOL_VERSION {
+        debug!("invalid proxy protocol version: {}", version);
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "invalid proxy protocol version",
+        ));
+    }
+    let command = header[0] & 0x0f;
+    let command = match Command::from_u8(command) {
+        Some(c) => c,
+        None => {
+            debug!("invalid proxy protocol command: {}", command);
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "invalid proxy protocol command",
+            ));
+        }
+    };
+
+    let family = (header[1] & 0xf0) >> 4;
+    let family = match Family::from_u8(family) {
+        None => {
+            debug!("invalid proxy family: {}", family);
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "invalid proxy family",
+            ));
+        }
+        Some(family) => {
+            trace!("PROXY family: {:?}", family);
+            family
+        }
+    };
+
+    let protocol = header[1] & 0x0f;
+    let protocol = match Protocol::from_u8(protocol) {
+        None => {
+            debug!("invalid proxy protocol: {}", protocol);
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "invalid proxy protocol",
+            ));
+        }
+        Some(protocol) => {
+            trace!("PROXY protocol: {:?}", protocol);
+            protocol
+        }
+    };
+
+    let len = u16::from_be_bytes([header[3], header[4]]);
+    let target_len = if matches!(command, Command::Local) {
+        None
+    } else {
+        family.len()
+    };
+
+    if let Some(target_len) = target_len {
+        if len as usize != target_len {
+            debug!("invalid proxy address length: {}", target_len);
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "invalid proxy address length",
+            ));
+        }
+    }
+
+    let mut raw =
+        unsafe { MaybeUninit::<[u8; PROXY_PACKET_MAX_PROXY_ADDR_SIZE]>::uninit().assume_init() };
+    read.read_exact(&mut raw[..len as usize]).await?;
+    let raw = &raw[..len as usize];
+
+    let mut discovered_src = None;
+    let mut discovered_dest = None;
+
+    match family {
+        Family::Unspecified => {
+            debug!("unspecified PROXY family data: {:?}", raw);
+        }
+        Family::Ipv4 => {
+            let src_addr = IpAddr::V4(Ipv4Addr::from(to_array(&raw[..4])));
+            let dest_addr = IpAddr::V4(Ipv4Addr::from(to_array(&raw[4..8])));
+            let src_port = u16::from_be_bytes((&raw[8..10]).try_into().unwrap());
+            let dest_port = u16::from_be_bytes((&raw[10..12]).try_into().unwrap());
+            discovered_src = Some(SocketAddr::new(src_addr, src_port));
+            discovered_dest = Some(SocketAddr::new(dest_addr, dest_port));
+        }
+        Family::Ipv6 => {
+            let src_addr = IpAddr::V6(to_array(&raw[..16]).into());
+            let dest_addr = IpAddr::V6(to_array(&raw[16..32]).into());
+            let src_port = u16::from_be_bytes((&raw[32..34]).try_into().unwrap());
+            let dest_port = u16::from_be_bytes((&raw[34..36]).try_into().unwrap());
+            discovered_src = Some(SocketAddr::new(src_addr, src_port));
+            discovered_dest = Some(SocketAddr::new(dest_addr, dest_port));
+        }
+        Family::Unix => {
+            warn!("unsupported UNIX PROXY family, ignored.");
+        }
+    }
+
+    Ok((
+        ProxyResult::Proxy(ProxyInfo {
+            command,
+            family,
+            protocol,
+            discovered_dest,
+            discovered_src,
+        }),
+        read,
+    ))
+}
+
 impl AsyncRead for WrappedStream {
     #[inline]
     fn poll_read(
@@ -149,205 +281,90 @@ impl AsyncRead for WrappedStream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        if !matches!(self.proxy_mode, ProxyMode::None) && self.proxy_header_target > 0 {
-            let index = self.proxy_header_index;
-            let target = self.proxy_header_target;
-            let mut proxy_header =
-                [MaybeUninit::uninit(); PROXY_PACKET_HEADER_LEN + PROXY_PACKET_MAX_PROXY_ADDR_SIZE];
-            let mut read_buf = ReadBuf::uninit(&mut proxy_header[index..target]);
-            match self.inner.as_mut().poll_read(cx, &mut read_buf) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Ready(Ok(())) => {
-                    (&mut self.proxy_header[index..index + read_buf.filled().len()])
-                        .copy_from_slice(read_buf.filled());
+        assert!(buf.capacity() >= PROXY_SIGNATURE.len());
+        if self.fused_error {
+            return Poll::Ready(Err(io::Error::new(
+                ErrorKind::Unsupported,
+                "called read after error",
+            )));
+        }
+        if matches!(self.proxy_mode, ProxyMode::None) {
+            return self.inner.as_mut().unwrap().as_mut().poll_read(cx, buf);
+        }
 
-                    self.proxy_header_index += read_buf.filled().len();
-
-                    // check signature
-                    let signature_end = self.proxy_header_index.min(12);
-                    if self.proxy_header[0..signature_end] != PROXY_SIGNATURE[0..signature_end] {
-                        // re-emit everything / not a proxy connection
-                        if matches!(self.proxy_mode, ProxyMode::Require) {
-                            debug!("attempted non-proxy connection when required");
-                            return Poll::Ready(Err(io::Error::new(
-                                ErrorKind::InvalidData,
-                                "invalid proxy protocol version",
-                            )));
-                        }
-                        self.proxy_header_target = 0;
-                    } else if self.proxy_header_index >= PROXY_PACKET_HEADER_LEN {
-                        let version = (self.proxy_header[12] & 0xf0) >> 4;
-                        if version != PROXY_PROTOCOL_VERSION {
-                            debug!("invalid proxy protocol version: {}", version);
-                            return Poll::Ready(Err(io::Error::new(
-                                ErrorKind::InvalidData,
-                                "invalid proxy protocol version",
-                            )));
-                        }
-                        let command = self.proxy_header[12] & 0x0f;
-                        let command = match Command::from_u8(command) {
-                            Some(c) => c,
-                            None => {
-                                debug!("invalid proxy protocol command: {}", command);
-                                return Poll::Ready(Err(io::Error::new(
-                                    ErrorKind::InvalidData,
-                                    "invalid proxy protocol command",
-                                )));
-                            }
-                        };
-                        self.command = Some(command);
-
-                        let family = (self.proxy_header[13] & 0xf0) >> 4;
-                        self.family = match Family::from_u8(family) {
-                            None => {
-                                debug!("invalid proxy family: {}", family);
-                                return Poll::Ready(Err(io::Error::new(
-                                    ErrorKind::InvalidData,
-                                    "invalid proxy family",
-                                )));
-                            }
-                            Some(family) => {
-                                trace!("PROXY family: {:?}", family);
-                                family
-                            }
-                        };
-
-                        let protocol = self.proxy_header[13] & 0x0f;
-                        self.protocol = match Protocol::from_u8(protocol) {
-                            None => {
-                                debug!("invalid proxy protocol: {}", protocol);
-                                return Poll::Ready(Err(io::Error::new(
-                                    ErrorKind::InvalidData,
-                                    "invalid proxy protocol",
-                                )));
-                            }
-                            Some(protocol) => {
-                                trace!("PROXY protocol: {:?}", protocol);
-                                protocol
-                            }
-                        };
-
-                        let len =
-                            u16::from_be_bytes([self.proxy_header[14], self.proxy_header[15]]);
-                        let target_len = if matches!(command, Command::Local) {
-                            None
-                        } else {
-                            self.family.len()
-                        };
-
-                        if let Some(target_len) = target_len {
-                            if len as usize != target_len {
-                                debug!("invalid proxy address length: {}", target_len);
-                                return Poll::Ready(Err(io::Error::new(
-                                    ErrorKind::InvalidData,
-                                    "invalid proxy address length",
-                                )));
-                            }
-                        }
-
-                        self.proxy_header_target = PROXY_PACKET_HEADER_LEN + len as usize;
-                        if self.proxy_header_index as usize >= self.proxy_header_target {
-                            let raw = &self.proxy_header
-                                [PROXY_PACKET_HEADER_LEN..self.proxy_header_target];
-
-                            match self.family {
-                                Family::Unspecified => {
-                                    trace!("unspecified PROXY family data: {:?}", raw);
-                                }
-                                Family::Ipv4 => {
-                                    let src_addr = IpAddr::V4(Ipv4Addr::from(to_array(&raw[..4])));
-                                    let dest_addr =
-                                        IpAddr::V4(Ipv4Addr::from(to_array(&raw[4..8])));
-                                    let src_port =
-                                        u16::from_be_bytes((&raw[8..10]).try_into().unwrap());
-                                    let dest_port =
-                                        u16::from_be_bytes((&raw[10..12]).try_into().unwrap());
-                                    self.discovered_src = Some(SocketAddr::new(src_addr, src_port));
-                                    self.discovered_dest =
-                                        Some(SocketAddr::new(dest_addr, dest_port));
-                                }
-                                Family::Ipv6 => {
-                                    let src_addr = IpAddr::V6(to_array(&raw[..16]).into());
-                                    let dest_addr = IpAddr::V6(to_array(&raw[16..32]).into());
-                                    let src_port =
-                                        u16::from_be_bytes((&raw[32..34]).try_into().unwrap());
-                                    let dest_port =
-                                        u16::from_be_bytes((&raw[34..36]).try_into().unwrap());
-                                    self.discovered_src = Some(SocketAddr::new(src_addr, src_port));
-                                    self.discovered_dest =
-                                        Some(SocketAddr::new(dest_addr, dest_port));
-                                }
-                                Family::Unix => {
-                                    warn!("unsupported UNIX PROXY family, ignored.");
-                                }
-                            }
-                            self.proxy_header_rewrite_index = self.proxy_header_target;
-                            self.proxy_header_target = 0;
-                        }
-                    }
+        if self.pending_read_proxy.is_none() {
+            self.pending_read_proxy = Some(Box::pin(read_proxy(self.inner.take().unwrap())));
+        }
+        let output = self.pending_read_proxy.as_mut().unwrap().as_mut().poll(cx);
+        match output {
+            Poll::Ready(Err(e)) => {
+                self.fused_error = true;
+                self.pending_read_proxy = None;
+                Poll::Ready(Err(e))
+            }
+            Poll::Ready(Ok((ProxyResult::SignatureBytes(bytes), stream))) => {
+                if matches!(self.proxy_mode, ProxyMode::Require) {
+                    return Poll::Ready(Err(io::Error::new(
+                        ErrorKind::InvalidData,
+                        "required a PROXYv2 header, none found",
+                    )));
                 }
+                self.proxy_mode = ProxyMode::None;
+                buf.put_slice(&bytes[..]);
+                self.pending_read_proxy = None;
+                self.inner = Some(stream);
+                Poll::Ready(Ok(()))
             }
-        }
-        if !matches!(self.as_ref().proxy_mode, ProxyMode::None)
-            && self.proxy_header_target == 0
-            && self.proxy_header_rewrite_index < self.proxy_header_index
-        {
-            let len = self.proxy_header_index - self.proxy_header_rewrite_index;
-            let actual_len = if len < buf.remaining() {
-                len
-            } else {
-                buf.remaining()
-            };
-            buf.put_slice(
-                &self.proxy_header
-                    [self.proxy_header_rewrite_index..self.proxy_header_rewrite_index + actual_len],
-            );
-            self.proxy_header_rewrite_index += actual_len;
-            if buf.remaining() == 0 {
-                return Poll::Ready(Ok(()));
+            Poll::Ready(Ok((ProxyResult::Proxy(info), stream))) => {
+                self.proxy_mode = ProxyMode::None;
+                self.info = Some(info);
+                self.pending_read_proxy = None;
+                self.inner = Some(stream);
+                Poll::Ready(Ok(()))
             }
+            Poll::Pending => Poll::Pending,
         }
-
-        self.inner.as_mut().poll_read(cx, buf)
     }
 }
 
 impl WrappedStream {
     /// Returns `true` if PROXYv2 information was sent
     pub fn was_proxied(&self) -> bool {
-        self.command.is_some()
+        self.info.is_some()
     }
 
-    /// PROXY reported command or None
+    /// PROXYv2 reported command or None
     pub fn command(&self) -> Option<Command> {
-        self.command
+        self.info.as_ref().map(|x| x.command)
     }
 
-    /// PROXY reported family or Unspecified
-    pub fn family(&self) -> Family {
-        self.family
+    /// PROXYv2 reported family or None
+    pub fn family(&self) -> Option<Family> {
+        self.info.as_ref().map(|x| x.family)
     }
 
-    /// PROXY reported protocol or Unspecified
-    pub fn protocol(&self) -> Protocol {
-        self.protocol
+    /// PROXYv2 reported protocol or None
+    pub fn protocol(&self) -> Option<Protocol> {
+        self.info.as_ref().map(|x| x.protocol)
     }
 
-    /// PROXY reported destination or None
+    /// PROXYv2 reported destination or None
     pub fn destination(&self) -> Option<SocketAddr> {
-        self.discovered_dest
+        self.info.as_ref().map(|x| x.discovered_dest).flatten()
     }
 
-    /// PROXY reported source or original address if none
+    /// PROXYv2 reported source or original address if none
     pub fn source(&self) -> SocketAddr {
-        self.discovered_src
-            .unwrap_or_else(|| self.inner.remote_addr())
+        self.info
+            .as_ref()
+            .map(|x| x.discovered_src)
+            .flatten()
+            .unwrap_or_else(|| self.inner.as_ref().unwrap().remote_addr())
     }
 
     /// The actual source that connected to us
     pub fn original_source(&self) -> SocketAddr {
-        self.inner.remote_addr()
+        self.inner.as_ref().unwrap().remote_addr()
     }
 }
 
@@ -358,7 +375,7 @@ impl AsyncWrite for WrappedStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        self.inner.as_mut().poll_write(cx, buf)
+        self.inner.as_mut().unwrap().as_mut().poll_write(cx, buf)
     }
 
     #[inline]
@@ -367,22 +384,26 @@ impl AsyncWrite for WrappedStream {
         cx: &mut Context<'_>,
         bufs: &[io::IoSlice<'_>],
     ) -> Poll<io::Result<usize>> {
-        self.inner.as_mut().poll_write_vectored(cx, bufs)
+        self.inner
+            .as_mut()
+            .unwrap()
+            .as_mut()
+            .poll_write_vectored(cx, bufs)
     }
 
     #[inline]
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.inner.as_mut().poll_flush(cx)
+        self.inner.as_mut().unwrap().as_mut().poll_flush(cx)
     }
 
     #[inline]
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.inner.as_mut().poll_shutdown(cx)
+        self.inner.as_mut().unwrap().as_mut().poll_shutdown(cx)
     }
 
     #[inline]
     fn is_write_vectored(&self) -> bool {
-        self.inner.is_write_vectored()
+        self.inner.as_ref().unwrap().is_write_vectored()
     }
 }
 
