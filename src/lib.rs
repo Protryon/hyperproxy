@@ -171,6 +171,15 @@ impl tonic::transport::server::Connected for WrappedStream {
     }
 }
 
+#[cfg(feature = "tonic")]
+pub fn tonic_remote_addr<T>(request: &tonic::Request<T>) -> Option<SocketAddr> {
+    request
+        .extensions()
+        .get::<TcpConnectInfo>()
+        .expect("missing TCP connect info (was hyperproxy inline with tonic?)")
+        .remote_addr()
+}
+
 fn to_array<const SIZE: usize>(from: &[u8]) -> [u8; SIZE] {
     from.try_into().unwrap()
 }
