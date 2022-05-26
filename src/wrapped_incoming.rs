@@ -44,6 +44,19 @@ impl WrappedIncoming {
     }
 }
 
+impl Accept for WrappedIncoming {
+    type Conn = WrappedStream;
+
+    type Error = std::io::Error;
+
+    fn poll_accept(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Self::Conn, Self::Error>>> {
+        self.poll_next(cx)
+    }
+}
+
 impl Stream for WrappedIncoming {
     type Item = Result<WrappedStream, std::io::Error>;
 
