@@ -180,6 +180,13 @@ pub fn tonic_remote_addr<T>(request: &tonic::Request<T>) -> Option<SocketAddr> {
         .remote_addr()
 }
 
+#[cfg(feature = "axum")]
+impl<'a> axum::extract::connect_info::Connected<&'a WrappedStream> for SocketAddr {
+    fn connect_info(target: &'a WrappedStream) -> Self {
+        target.source()
+    }
+}
+
 fn to_array<const SIZE: usize>(from: &[u8]) -> [u8; SIZE] {
     from.try_into().unwrap()
 }
