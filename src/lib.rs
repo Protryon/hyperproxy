@@ -18,8 +18,10 @@ use std::{
 };
 
 use futures::Future;
-use hyper::server::conn::AddrStream;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
+use tokio::{
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf},
+    net::tcp::{OwnedReadHalf, OwnedWriteHalf},
+};
 
 mod wrapped_incoming;
 pub use wrapped_incoming::WrappedIncoming;
@@ -128,13 +130,15 @@ enum ProxyResult {
 
 /// A wrapper over [`hyper::server::conn::AddrStream`] that grabs PROXYv2 information
 pub struct WrappedStream {
-    inner: Option<Pin<Box<AddrStream>>>,
+    remote_addr: SocketAddr,
+    inner_write: Pin<Box<OwnedWriteHalf>>,
+    inner_read: Option<Pin<Box<OwnedReadHalf>>>,
     #[cfg(feature = "track_conn_count")]
     conn_count: Arc<AtomicU64>,
     pending_read_proxy: Option<
         Pin<
             Box<
-                dyn Future<Output = io::Result<(ProxyResult, Pin<Box<AddrStream>>)>>
+                dyn Future<Output = io::Result<(ProxyResult, Pin<Box<OwnedReadHalf>>)>>
                     + Send
                     + Sync
                     + 'static,
@@ -328,12 +332,17 @@ impl AsyncRead for WrappedStream {
             )));
         }
         if matches!(self.proxy_mode, ProxyMode::None) {
-            return self.inner.as_mut().unwrap().as_mut().poll_read(cx, buf);
+            return self
+                .inner_read
+                .as_mut()
+                .unwrap()
+                .as_mut()
+                .poll_read(cx, buf);
         }
         assert!(buf.remaining() >= PROXY_SIGNATURE.len());
 
         if self.pending_read_proxy.is_none() {
-            self.pending_read_proxy = Some(Box::pin(read_proxy(self.inner.take().unwrap())));
+            self.pending_read_proxy = Some(Box::pin(read_proxy(self.inner_read.take().unwrap())));
         }
         let output = self.pending_read_proxy.as_mut().unwrap().as_mut().poll(cx);
         match output {
@@ -352,23 +361,31 @@ impl AsyncRead for WrappedStream {
                 self.proxy_mode = ProxyMode::None;
                 buf.put_slice(&bytes[..]);
                 self.pending_read_proxy = None;
-                self.inner = Some(stream);
+                self.inner_read = Some(stream);
                 #[cfg(feature = "tonic")]
                 {
                     *self.connect_info.write().unwrap() = Some(self.source());
                 }
-                self.inner.as_mut().unwrap().as_mut().poll_read(cx, buf)
+                self.inner_read
+                    .as_mut()
+                    .unwrap()
+                    .as_mut()
+                    .poll_read(cx, buf)
             }
             Poll::Ready(Ok((ProxyResult::Proxy(info), stream))) => {
                 self.proxy_mode = ProxyMode::None;
                 self.info = Some(info);
                 self.pending_read_proxy = None;
-                self.inner = Some(stream);
+                self.inner_read = Some(stream);
                 #[cfg(feature = "tonic")]
                 {
                     *self.connect_info.write().unwrap() = Some(self.source());
                 }
-                self.inner.as_mut().unwrap().as_mut().poll_read(cx, buf)
+                self.inner_read
+                    .as_mut()
+                    .unwrap()
+                    .as_mut()
+                    .poll_read(cx, buf)
             }
             Poll::Pending => Poll::Pending,
         }
@@ -407,12 +424,12 @@ impl WrappedStream {
             .as_ref()
             .map(|x| x.discovered_src)
             .flatten()
-            .unwrap_or_else(|| self.inner.as_ref().unwrap().remote_addr())
+            .unwrap_or_else(|| self.remote_addr)
     }
 
     /// The actual source that connected to us
     pub fn original_source(&self) -> SocketAddr {
-        self.inner.as_ref().unwrap().remote_addr()
+        self.remote_addr
     }
 }
 
@@ -423,7 +440,7 @@ impl AsyncWrite for WrappedStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        self.inner.as_mut().unwrap().as_mut().poll_write(cx, buf)
+        self.inner_write.as_mut().poll_write(cx, buf)
     }
 
     #[inline]
@@ -432,26 +449,22 @@ impl AsyncWrite for WrappedStream {
         cx: &mut Context<'_>,
         bufs: &[io::IoSlice<'_>],
     ) -> Poll<io::Result<usize>> {
-        self.inner
-            .as_mut()
-            .unwrap()
-            .as_mut()
-            .poll_write_vectored(cx, bufs)
+        self.inner_write.as_mut().poll_write_vectored(cx, bufs)
     }
 
     #[inline]
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.inner.as_mut().unwrap().as_mut().poll_flush(cx)
+        self.inner_write.as_mut().poll_flush(cx)
     }
 
     #[inline]
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.inner.as_mut().unwrap().as_mut().poll_shutdown(cx)
+        self.inner_write.as_mut().poll_shutdown(cx)
     }
 
     #[inline]
     fn is_write_vectored(&self) -> bool {
-        self.inner.as_ref().unwrap().is_write_vectored()
+        self.inner_write.is_write_vectored()
     }
 }
 

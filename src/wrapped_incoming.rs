@@ -65,8 +65,12 @@ impl Stream for WrappedIncoming {
             Poll::Ready(Some(Ok(stream))) => {
                 #[cfg(feature = "track_conn_count")]
                 self.conn_count.fetch_add(1, Ordering::SeqCst);
+                let remote_addr = stream.remote_addr();
+                let (read, write) = stream.into_inner().into_split();
                 Poll::Ready(Some(Ok(WrappedStream {
-                    inner: Some(Box::pin(stream)),
+                    remote_addr,
+                    inner_read: Some(Box::pin(read)),
+                    inner_write: Box::pin(write),
                     #[cfg(feature = "track_conn_count")]
                     conn_count: self.conn_count.clone(),
                     #[cfg(feature = "tonic")]
